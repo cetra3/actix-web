@@ -45,7 +45,6 @@ pub struct Http1Dispatcher<T: IoStream, H: HttpHandler + 'static> {
     buf: BytesMut,
     tasks: VecDeque<Entry<H>>,
     error: Option<HttpDispatchError>,
-    ka_expire: Instant,
     ka_timer: Option<Delay>,
 }
 
@@ -94,12 +93,13 @@ where
         keepalive_timer: Option<Delay>,
     ) -> Self {
         let addr = stream.peer_addr();
-        let (ka_expire, ka_timer) = if let Some(delay) = keepalive_timer {
-            (delay.deadline(), Some(delay))
+
+        let ka_timer = if let Some(delay) = keepalive_timer {
+            Some(delay)
         } else if let Some(delay) = settings.keep_alive_timer() {
-            (delay.deadline(), Some(delay))
+            Some(delay)
         } else {
-            (settings.now(), None)
+            None
         };
 
         let flags = if is_eof {
@@ -120,8 +120,7 @@ where
             addr,
             buf,
             settings,
-            ka_timer,
-            ka_expire,
+            ka_timer
         }
     }
 
@@ -129,12 +128,9 @@ where
         settings: ServiceConfig<H>,
         stream: T,
         status: StatusCode,
-        mut keepalive_timer: Option<Delay>,
+        ka_timer: Option<Delay>,
         buf: BytesMut,
     ) -> Self {
-        if let Some(deadline) = settings.client_timer_expire() {
-            let _ = keepalive_timer.as_mut().map(|delay| delay.reset(deadline));
-        }
 
         let mut disp = Http1Dispatcher {
             flags: Flags::STARTED | Flags::READ_DISCONNECTED | Flags::FLUSHED,
@@ -144,8 +140,7 @@ where
             tasks: VecDeque::new(),
             error: None,
             addr: None,
-            ka_timer: keepalive_timer,
-            ka_expire: settings.now(),
+            ka_timer,
             buf,
             settings,
         };
@@ -274,55 +269,43 @@ where
 
     /// keep-alive timer. returns `true` is keep-alive, otherwise drop
     fn poll_keepalive(&mut self) -> Result<(), HttpDispatchError> {
-        if let Some(ref mut timer) = self.ka_timer {
-            match timer.poll() {
-                Ok(Async::Ready(_)) => {
-                    // if we get timer during shutdown, just drop connection
-                    if self.flags.contains(Flags::SHUTDOWN) {
-                        let io = self.stream.get_mut();
-                        let _ = IoStream::set_linger(io, Some(Duration::from_secs(0)));
-                        let _ = IoStream::shutdown(io, Shutdown::Both);
-                        return Err(HttpDispatchError::ShutdownTimeout);
-                    }
-                    if timer.deadline() >= self.ka_expire {
-                        // check for any outstanding request handling
-                        if self.tasks.is_empty() && self.flags.contains(Flags::FLUSHED) {
-                            if !self.flags.contains(Flags::STARTED) {
-                                // timeout on first request (slow request) return 408
-                                trace!("Slow request timeout");
-                                self.flags
-                                    .insert(Flags::STARTED | Flags::READ_DISCONNECTED);
-                                self.tasks.push_back(Entry::Error(ServerError::err(
-                                    Version::HTTP_11,
-                                    StatusCode::REQUEST_TIMEOUT,
-                                )));
-                            } else {
-                                trace!("Keep-alive timeout, close connection");
-                                self.flags.insert(Flags::SHUTDOWN);
 
-                                // start shutdown timer
-                                if let Some(deadline) =
-                                    self.settings.client_shutdown_timer()
-                                {
-                                    timer.reset(deadline);
-                                    let _ = timer.poll();
-                                } else {
-                                    return Ok(());
-                                }
-                            }
-                        } else if let Some(dl) = self.settings.keep_alive_expire() {
-                            timer.reset(dl);
-                            let _ = timer.poll();
-                        }
-                    } else {
-                        timer.reset(self.ka_expire);
-                        let _ = timer.poll();
-                    }
+        if let Some(ref mut timer) = self.ka_timer {
+            //If the timer is ready, then the keepalive has been hit
+            if let Ok(Async::Ready(_)) = timer.poll() {
+                if self.flags.contains(Flags::SHUTDOWN) {
+                    let io = self.stream.get_mut();
+                    let _ = IoStream::set_linger(io, Some(Duration::from_secs(0)));
+                    let _ = IoStream::shutdown(io, Shutdown::Both);
+                    return Err(HttpDispatchError::ShutdownTimeout);
                 }
-                Ok(Async::NotReady) => (),
-                Err(e) => {
-                    error!("Timer error {:?}", e);
-                    return Err(HttpDispatchError::Unknown);
+
+                                        // check for any outstanding request handling
+                if self.tasks.is_empty() && self.flags.contains(Flags::FLUSHED) {
+                    if !self.flags.contains(Flags::STARTED) {
+                        // timeout on first request (slow request) return 408
+                        debug!("Slow request timeout");
+                        self.flags
+                            .insert(Flags::STARTED | Flags::READ_DISCONNECTED);
+                        self.tasks.push_back(Entry::Error(ServerError::err(
+                            Version::HTTP_11,
+                            StatusCode::REQUEST_TIMEOUT,
+                        )));
+                    } else {
+                        debug!("Keep-alive timeout, close connection: {:?}", self.addr);
+                        self.flags.insert(Flags::SHUTDOWN);
+
+                        // start shutdown timer
+                        if let Some(deadline) =
+                            self.settings.client_shutdown_timer()
+                        {
+                            timer.reset(deadline);
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                } else if let Some(dl) = self.settings.keep_alive_expire() {
+                        timer.reset(dl);
                 }
             }
         }
@@ -567,9 +550,12 @@ where
             }
         }
 
-        if self.ka_timer.is_some() && updated {
-            if let Some(expire) = self.settings.keep_alive_expire() {
-                self.ka_expire = expire;
+        if updated {
+            if let Some(ref mut timer) = self.ka_timer {
+                if let Some(expire) = self.settings.keep_alive_expire() {
+                    timer.reset(expire);
+                    debug!("New Expire:{:?}, Addr:{:?}", expire, self.addr);
+                }
             }
         }
         Ok(updated)
